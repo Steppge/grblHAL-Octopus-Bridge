@@ -4,7 +4,8 @@
   Connects the grblHAL display (ESP32-P4) to the controller, over a USB cable or WiFi:
     display link (stream 1)   UART1 GPIO11 TX -> J26-7 (PD6 RX2), GPIO12 RX <- J26-9 (PD5 TX2)
     gamepad (stream 0)        UART2 GPIO13 TX -> TFT-4 (PA10 RX1), GPIO14 RX <- TFT-3 (PA9 TX1)
-  both 921600 baud.
+  display link 921600 baud, gamepad 230400 baud: USART1 of the Octopus shares the APB2 bus with the SD
+  card interface, at 921600 the CPU core froze now and then during SD card access (2026-11), 460800 was ok.
 
   USB: the S3 is USB host on its "USB" socket (GPIO19 D- / GPIO20 D+), the display a USB device with two
   CDC-ACM channels, interface 0 = display link, interface 2 = gamepad.
@@ -53,7 +54,8 @@
 #define NET_TIMEOUT_MS  3000        // nothing from the display over WiFi for this long = gone (heartbeat 500 ms)
 #define NET_TX_MS       100         // max. wait for a TCP send to the display
 
-#define BRIDGE_BAUD     921600
+#define LINK_BAUD       921600
+#define GAMEPAD_BAUD    230400      // USART1 of the Octopus, see above
 #define UART_BUF        4096
 #define USB_BUF         2048
 #define USB_TX_MS       100         // max. wait for a USB transfer to the display
@@ -71,14 +73,15 @@ typedef struct {
     uart_port_t uart;
     int tx, rx;
     uint8_t iface;                  // CDC interface number on the display
+    int baud;
     cdc_acm_dev_hdl_t dev;          // NULL while not connected
     SemaphoreHandle_t lock;         // guards dev
     uint32_t to_ctrl, to_disp;      // bytes forwarded
 } channel_t;
 
 static channel_t ch[2] = {
-    { .name = "link",    .uart = UART_NUM_1, .tx = 11, .rx = 12, .iface = 0 },
-    { .name = "gamepad", .uart = UART_NUM_2, .tx = 13, .rx = 14, .iface = 2 },
+    { .name = "link",    .uart = UART_NUM_1, .tx = 11, .rx = 12, .iface = 0, .baud = LINK_BAUD },
+    { .name = "gamepad", .uart = UART_NUM_2, .tx = 13, .rx = 14, .iface = 2, .baud = GAMEPAD_BAUD },
 };
 
 static volatile int pass = -1;      // channel passed through to the console, -1 = none
@@ -220,7 +223,7 @@ static void uart_task (void *arg)
 static void uart_start (channel_t *c)
 {
     const uart_config_t cfg = {
-        .baud_rate = BRIDGE_BAUD,
+        .baud_rate = c->baud,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -502,7 +505,7 @@ static void status (void)
     printf("Octopus-Bridge %s, built %s %s\n", BRIDGE_VERSION, __DATE__, __TIME__);
     for(int i = 0; i < 2; i++)
         printf("  %-8s UART%d TX GPIO%d RX GPIO%d %d baud, display %s, %lu bytes to the controller, %lu to the display\n",
-                ch[i].name, ch[i].uart, ch[i].tx, ch[i].rx, BRIDGE_BAUD,
+                ch[i].name, ch[i].uart, ch[i].tx, ch[i].rx, ch[i].baud,
                 ch[i].dev ? "connected" : (i == 0 ? tcp_client >= 0 : recent(udp_seen)) ? "over WiFi" : "-",
                 (unsigned long)ch[i].to_ctrl, (unsigned long)ch[i].to_disp);
 
@@ -525,7 +528,7 @@ static void command (char *line)
         printf("network '%s', password '%s' (the display gets both over the USB cable)\n", AP_SSID, ap_pass);
     else if(!strcmp(line, "link") || !strcmp(line, "gamepad")) {
         pass = strcmp(line, "link") ? 1 : 0;
-        printf("pass-through %s at %d baud, display data is dropped meanwhile, Ctrl+] ends it\n", line, BRIDGE_BAUD);
+        printf("pass-through %s at %d baud, display data is dropped meanwhile, Ctrl+] ends it\n", line, ch[pass].baud);
     } else if(*line)
         printf("commands: status, wifi (network and password), link, gamepad (pass-through of that UART to this console)\n");
 }

@@ -2,3 +2,5 @@
 sdkconfig.bridge
 managed_components/
 dependencies.lock
+wifitest/
+p4usbtest/

@@ -21,7 +21,8 @@ GPIO9/10 are kept for a later sender UART to USART3 (WIFI socket).
 
 The display's USB-C "USB 2.0" goes to the S3's "USB" socket (GPIO19 D-, GPIO20 D+). For powering the display over the cable, a socket of its own with VBUS straight from the 24 V -> 5 V converter (not through the S3, the display draws about 1 A).
 
-Both UARTs run at 921600 baud. Set `DISPLAY_LINK_BAUD` and `GAMEPAD_BAUD` to 921600 in grblHAL's my_machine.h.
+The display link runs at 921600 baud, the gamepad at 230400 (921600 on USART1 stalled the Octopus during SD card
+access). In grblHAL's `my_machine.h`: `DISPLAY_LINK_BAUD 921600` and `GAMEPAD_BAUD 230400`.
 
 ## Function
 
@@ -53,7 +54,13 @@ PlatformIO, ESP-IDF (pioarduino 55.03.312-1), flashed over the "UART" socket:
 pio run -t upload
 ```
 
-## Test firmware
+## Related
 
-- `wifitest/`: scans for one network and prints its signal strength (no connection, no password).
-- `p4usbtest/`: two CDC channels on the P4's "USB 2.0" with heartbeats, the test that found the 512 byte endpoint problem.
+- Display firmware (CrowPanel 9" ESP32-P4) and the grblHAL plugin:
+  [Steppge/grblHAL-Plugin-Display](https://github.com/Steppge/grblHAL-Plugin-Display)
+- Gamepad plugin and receiver: [Steppge/grblHAL-Plugin-Gamepad](https://github.com/Steppge/grblHAL-Plugin-Gamepad)
+- grblHAL for the BTT Octopus Pro: [Steppge/grblHAL-OctopusPro-CNC-Laser](https://github.com/Steppge/grblHAL-OctopusPro-CNC-Laser)
+
+## License
+
+GPL v3 or later, see [LICENSE](LICENSE). Copyright (c) 2026 Steppge.

@@ -48,11 +48,31 @@ The console is on the USB-C "UART" (CH343, COM19, 115200 baud). Commands:
 
 ## Build and flash
 
-PlatformIO, ESP-IDF (pioarduino 55.03.312-1), flashed over the "UART" socket:
+PlatformIO, ESP-IDF (pioarduino 55.03.312-1), flashed over the "UART" socket (its COM port):
 
 ```
-pio run -t upload
+pio run -t upload --upload-port COM19
 ```
+
+From bridge 0.4 on (two app partitions, `partitions.csv`; the first time flashed over USB, then the whole
+flash is written) the bridge can be updated through the controller, without a cable at the bridge: the
+grblHAL display link plugin 1.2 sends `bridge.bin` from the SD card of the Octopus with `$BRIDGE`, in blocks
+with acknowledge, CRC32 and the image check of the ESP32; a firmware that does not get up is rolled back.
+In the grblHAL project:
+
+```
+python tools/upload_firmware.py --bridge
+```
+
+copies `.pio/build/bridge/firmware.bin` of this project as `bridge.bin` to the SD card and runs `$BRIDGE`
+(about 20 s, only while the machine is idle or in an alarm; the display link pauses meanwhile).
+
+Board specific values are at the top of `src/main.c`: UART pins and baud rates, `LED_GPIO` (48 on the
+DevKitC-1 v1.0, 38 on v1.1), WiFi channel `AP_CHANNEL`.
+
+Security: the machine network is hidden, WPA2 with a random password of 16 characters and at most two
+devices. Inside it the display link (TCP 5000) and the gamepad (UDP 5001) have no login of their own:
+whoever is in the network can take the link. Keep the password to yourself (console command `wifi`).
 
 ## Related
 

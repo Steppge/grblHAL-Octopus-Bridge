@@ -16,7 +16,8 @@
   name and password of the network over the link channel ($BW line), so it can connect without cable.
   While the display is plugged in, USB is used and the access point is off.
 
-  Without the display the UARTs stay silent, the watchdogs in grblHAL stop jogging and hold a job.
+  Without the display the UARTs stay silent, the gamepad watchdog in grblHAL stops jogging; a job from the
+  SD card keeps running.
 
   Console on the "UART" USB-C (CH343, 115200): status, network name and password, and a pass-through of
   one UART to the console for tests without the display (Ctrl+] ends it).
@@ -40,11 +41,17 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "bootloader_random.h"
+#include "esp_ota_ops.h"
+#include "esp_rom_crc.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "led_strip.h"
 
-#define BRIDGE_VERSION  "0.3"
+#define BRIDGE_VERSION  "0.4"
+
+#define FW_BLOCK        1024        // firmware update from the controller: bytes per acknowledged block
+#define FW_TIMEOUT_MS   3000        // no update data for this long: given up
 
 #define AP_SSID         "grblHAL-Machine"
 #define AP_CHANNEL      6
@@ -52,7 +59,8 @@
 #define LINK_PORT       5000        // TCP: display link
 #define GAMEPAD_PORT    5001        // UDP: gamepad lines
 #define NET_TIMEOUT_MS  3000        // nothing from the display over WiFi for this long = gone (heartbeat 500 ms)
-#define NET_TX_MS       100         // max. wait for a TCP send to the display
+#define NET_TX_MS       500         // max. wait for a TCP send to the display, then the connection is closed
+                                    // (a short radio gap must not drop it: the display then drops its commands)
 
 #define LINK_BAUD       921600
 #define GAMEPAD_BAUD    230400      // USART1 of the Octopus, see above
@@ -106,8 +114,12 @@ static bool recent (TickType_t t)
     return t && xTaskGetTickCount() - t < pdMS_TO_TICKS(NET_TIMEOUT_MS);
 }
 
+static bool fw_running (void);
+
 static void forward_to_ctrl (channel_t *c, const uint8_t *data, size_t len)
 {
+    if(c == &ch[0] && fw_running())
+        return;     // during a firmware update the link UART carries only the update answers
     if(pass != c - ch) {
         uart_write_bytes(c->uart, data, len);
         c->to_ctrl += len;
@@ -192,7 +204,167 @@ static void usb_event (const cdc_acm_host_dev_event_data_t *event, void *arg)
     }
 }
 
-// controller -> display, or the console during a pass-through
+// ------------------------------------------------------------------------
+// Firmware update from the controller (grblHAL display link plugin, $BRIDGE with bridge.bin on its SD card),
+// on the link UART. Same protocol as the gamepad receiver:
+//   controller -> bridge   $FW,<size>,<crc32 hex>*<hh>, then the image in blocks of FW_BLOCK bytes
+//   bridge -> controller   >FA,<1|0>*<hh>   >FK,<bytes written>*<hh>   >FD,<1|0>*<hh>
+// The image goes to the other OTA partition, CRC32 and the image check of the ESP32 come first, then it
+// becomes the boot partition and the bridge restarts. A firmware that does not get up is rolled back.
+// ------------------------------------------------------------------------
+
+static struct {
+    bool on;
+    size_t size, got, n;
+    uint32_t crc, want;
+    TickType_t last;
+    esp_ota_handle_t ota;
+    const esp_partition_t *part;
+    uint8_t buf[FW_BLOCK];
+} fw;
+
+// a line to the controller, as the display sends them ('>' ... '*hh')
+static void ctrl_line (const char *body)
+{
+    char line[48];
+    uint8_t sum = 0;
+
+    for(const char *p = body; *p; p++)
+        sum ^= (uint8_t)*p;
+    int n = snprintf(line, sizeof(line), ">%s*%02X\n", body, sum);
+    uart_write_bytes(ch[0].uart, line, n);
+}
+
+static void fw_fail (const char *why)
+{
+    if(fw.on)
+        esp_ota_abort(fw.ota);
+    fw.on = false;
+    ESP_LOGW(TAG, "firmware update failed: %s", why);
+    ctrl_line("FD,0");
+}
+
+static void fw_start (unsigned long size, unsigned long crc)
+{
+    if(fw.on)
+        esp_ota_abort(fw.ota);
+    memset(&fw, 0, sizeof(fw));
+
+    fw.part = esp_ota_get_next_update_partition(NULL);
+    if(size == 0 || fw.part == NULL || size > fw.part->size ||
+        esp_ota_begin(fw.part, OTA_WITH_SEQUENTIAL_WRITES, &fw.ota) != ESP_OK) {   // erases sector by sector
+        ESP_LOGW(TAG, "firmware update refused (%lu bytes)", size);
+        ctrl_line("FA,0");
+        return;
+    }
+    fw.on = true;
+    fw.size = size;
+    fw.want = crc;
+    fw.last = xTaskGetTickCount();
+    ESP_LOGI(TAG, "firmware update: %lu bytes to %s", size, fw.part->label);
+    ctrl_line("FA,1");
+}
+
+// image bytes from the controller: each full block is written and acknowledged
+static void fw_data (const uint8_t *data, size_t len)
+{
+    fw.last = xTaskGetTickCount();
+
+    while(fw.on && len) {
+        size_t block = fw.size - fw.got < FW_BLOCK ? fw.size - fw.got : FW_BLOCK;
+        size_t take = block - fw.n < len ? block - fw.n : len;
+        memcpy(fw.buf + fw.n, data, take);
+        fw.n += take;
+        data += take;
+        len -= take;
+        if(fw.n < block)
+            continue;
+
+        if(esp_ota_write(fw.ota, fw.buf, fw.n) != ESP_OK) {
+            fw_fail("write");
+            return;
+        }
+        fw.crc = esp_rom_crc32_le(fw.crc, fw.buf, fw.n);
+        fw.got += fw.n;
+        fw.n = 0;
+
+        char body[24];
+        snprintf(body, sizeof(body), "FK,%u", (unsigned)fw.got);
+        ctrl_line(body);
+
+        if(fw.got == fw.size) {
+            if(fw.crc != fw.want) {
+                fw_fail("CRC");
+                return;
+            }
+            esp_err_t e = esp_ota_end(fw.ota);      // checks the image
+            fw.on = false;
+            if(e != ESP_OK || esp_ota_set_boot_partition(fw.part) != ESP_OK) {
+                ESP_LOGW(TAG, "firmware update failed: image check (%s)", esp_err_to_name(e));
+                ctrl_line("FD,0");
+                return;
+            }
+            ctrl_line("FD,1");
+            uart_wait_tx_done(ch[0].uart, pdMS_TO_TICKS(100));
+            ESP_LOGI(TAG, "firmware update done, restarting");
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
+    }
+}
+
+// watches the controller -> display bytes for "$FW,<size>,<crc>*hh", true when such a line ended at this byte
+static bool fw_scan (uint8_t c)
+{
+    static char line[48];
+    static size_t len = 0;
+    unsigned long size, crc;
+
+    if(c == '$')
+        len = 0;
+    else if(c == '\n' || c == '\r') {
+        line[len] = '\0';
+        len = 0;
+        char *star = strrchr(line, '*');
+        if(star == NULL || strncmp(line, "FW,", 3))
+            return false;
+        *star = '\0';
+        uint8_t sum = 0;
+        for(char *p = line; *p; p++)
+            sum ^= (uint8_t)*p;
+        if(strtoul(star + 1, NULL, 16) != sum || sscanf(line, "FW,%lu,%lx", &size, &crc) != 2)
+            return false;
+        fw_start(size, crc);
+        return true;
+    } else if(len < sizeof(line) - 1)
+        line[len++] = (char)c;
+
+    return false;
+}
+
+static bool fw_running (void)
+{
+    return fw.on;
+}
+
+// controller -> display over USB or WiFi
+static void to_display (channel_t *c, const uint8_t *buf, size_t n)
+{
+    if(n == 0)
+        return;
+
+    xSemaphoreTake(c->lock, portMAX_DELAY);
+    if(c->dev && cdc_acm_host_data_tx_blocking(c->dev, buf, n, USB_TX_MS) == ESP_OK) {
+        c->to_disp += n;
+        activity = xTaskGetTickCount();
+    }
+    xSemaphoreGive(c->lock);
+
+    if(!usb_plugged())
+        net_send(c, buf, n);
+}
+
+// controller -> display, or the console during a pass-through; the link channel also carries a firmware update
 static void uart_task (void *arg)
 {
     channel_t *c = arg;
@@ -200,23 +372,34 @@ static void uart_task (void *arg)
 
     for(;;) {
         int n = uart_read_bytes(c->uart, buf, sizeof(buf), pdMS_TO_TICKS(2));
-        if(n <= 0)
+        if(n <= 0) {
+            if(c == &ch[0] && fw.on && xTaskGetTickCount() - fw.last > pdMS_TO_TICKS(FW_TIMEOUT_MS))
+                fw_fail("timeout");
             continue;
+        }
 
         if(pass == c - ch) {
             uart_write_bytes(CONSOLE_UART, buf, n);
             continue;
         }
 
-        xSemaphoreTake(c->lock, portMAX_DELAY);
-        if(c->dev && cdc_acm_host_data_tx_blocking(c->dev, buf, n, USB_TX_MS) == ESP_OK) {
-            c->to_disp += n;
-            activity = xTaskGetTickCount();
+        if(c == &ch[0]) {
+            if(fw.on) {
+                fw_data(buf, n);
+                continue;
+            }
+            int i = 0;
+            while(i < n && !fw_scan(buf[i]))
+                i++;
+            if(i < n) {             // "$FW" line: up to it to the display, the rest is image data
+                to_display(c, buf, i + 1);
+                if(fw.on)
+                    fw_data(buf + i + 1, n - i - 1);
+                continue;
+            }
         }
-        xSemaphoreGive(c->lock);
 
-        if(!usb_plugged())
-            net_send(c, buf, n);
+        to_display(c, buf, n);
     }
 }
 
@@ -328,20 +511,32 @@ static void usb_run (void)
     }
 }
 
+// a socket bound to a port, -1 on failure
+static int open_socket (int type, uint16_t port)
+{
+    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY), .sin_port = htons(port) };
+    int s = socket(AF_INET, type, IPPROTO_IP);
+
+    if(s >= 0 && (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0 || (type == SOCK_STREAM && listen(s, 1) != 0))) {
+        close(s);
+        s = -1;
+    }
+    return s;
+}
+
 // Display link over TCP and gamepad over UDP, only while the display is not plugged in.
 static void net_task (void *arg)
 {
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY) };
     uint8_t buf[512];
+    int srv;
 
-    int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    addr.sin_port = htons(LINK_PORT);
-    bind(srv, (struct sockaddr *)&addr, sizeof(addr));
-    listen(srv, 1);
-
-    udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    addr.sin_port = htons(GAMEPAD_PORT);
-    bind(udp_sock, (struct sockaddr *)&addr, sizeof(addr));
+    // the sockets are retried until they work (the network stack may not be up yet)
+    while((srv = open_socket(SOCK_STREAM, LINK_PORT)) < 0 || (udp_sock = open_socket(SOCK_DGRAM, GAMEPAD_PORT)) < 0) {
+        ESP_LOGW(TAG, "WiFi: socket for port %u failed, again", srv < 0 ? LINK_PORT : GAMEPAD_PORT);
+        if(srv >= 0)
+            close(srv);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
     for(;;) {
         fd_set rd;
@@ -417,9 +612,13 @@ static void wifi_start (void)
     }
     if(nvs_open("bridge", NVS_READWRITE, &nvs) == ESP_OK) {
         if(nvs_get_str(nvs, "pass", ap_pass, &len) != ESP_OK || strlen(ap_pass) != AP_PASS_LEN) {
+            // true random numbers need an entropy source: the radio is not on yet, so the ADC noise source
+            // of the bootloader is switched on meanwhile (without it esp_random() is only pseudo random)
             static const char chars[] = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            bootloader_random_enable();
             for(int i = 0; i < AP_PASS_LEN; i++)
                 ap_pass[i] = chars[esp_random() % (sizeof(chars) - 1)];
+            bootloader_random_disable();
             ap_pass[AP_PASS_LEN] = '\0';
             nvs_set_str(nvs, "pass", ap_pass);
             nvs_commit(nvs);
@@ -597,6 +796,9 @@ void app_main (void)
     ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
 
     xTaskCreate(console_task, "console", 4096, NULL, 5, NULL);
+
+    // this firmware got up: keep it (without this a new firmware is rolled back at the next start)
+    esp_ota_mark_app_valid_cancel_rollback();
 
     usb_run();
 }

@@ -48,6 +48,9 @@ The console is on the USB-C "UART" (CH343, COM19, 115200 baud). Commands:
 
 ## Build and flash
 
+The whole setup (Octopus, bridge, P4 display, gamepad receiver) in order:
+[FLASHING.md](https://github.com/Steppge/grblHAL-Plugin-Display/blob/main/docs/FLASHING.md).
+
 PlatformIO, ESP-IDF (pioarduino 55.03.312-1), flashed over the "UART" socket (its COM port):
 
 ```
